@@ -1,0 +1,289 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+concurrency:
+  group: pr-automation-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run ESLint
+        id: eslint
+        run: |
+          npm run lint 2>&1 | tee eslint-output.txt
+          echo "eslint_exit_code=$?" >> $GITHUB_OUTPUT
+      
+      - name: Run Prettier check
+        id: prettier
+        run: |
+          npx prettier --check src/ 2>&1 | tee prettier-output.txt
+          echo "prettier_exit_code=$?" >> $GITHUB_OUTPUT
+      
+      - name: Compile Code Quality Report
+        id: quality_report
+        run: |
+          ESLINT_EXIT=${{ steps.eslint.outputs.eslint_exit_code }}
+          PRETTIER_EXIT=${{ steps.prettier.outputs.prettier_exit_code }}
+          echo "## Code Quality Report" > quality_report.md
+          echo "" >> quality_report.md
+          echo "### ESLint" >> quality_report.md
+          if [ $ESLINT_EXIT -eq 0 ]; then
+            echo "✅ ESLint passed successfully." >> quality_report.md
+          else
+            echo "❌ ESLint found issues:" >> quality_report.md
+            cat eslint-output.txt | head -30 >> quality_report.md
+          fi
+          echo "" >> quality_report.md
+          echo "### Prettier" >> quality_report.md
+          if [ $PRETTIER_EXIT -eq 0 ]; then
+            echo "✅ Prettier formatting is correct." >> quality_report.md
+          else
+            echo "❌ Prettier formatting issues:" >> quality_report.md
+            cat prettier-output.txt | head -30 >> quality_report.md
+          fi
+      
+      - name: Post Code Quality Report as PR Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('quality_report.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+
+  testing-suite:
+    name: Testing Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run tests with coverage
+        id: tests
+        run: |
+          npm run test:coverage 2>&1 | tee test-output.txt
+          echo "test_exit_code=$?" >> $GITHUB_OUTPUT
+          # Extract coverage summary
+          grep -A 20 "File.*% Stmts.*% Branch.*% Funcs.*% Lines" test-output.txt | head -30 > coverage-summary.txt || true
+      
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+      
+      - name: Compile Test Coverage Report
+        id: coverage_report
+        run: |
+          TEST_EXIT=${{ steps.tests.outputs.test_exit_code }}
+          echo "## Test Coverage Report" > coverage_report.md
+          echo "" >> coverage_report.md
+          if [ -f coverage-summary.txt ]; then
+            echo "### Coverage Summary" >> coverage_report.md
+            echo '```' >> coverage_report.md
+            cat coverage-summary.txt >> coverage_report.md
+            echo '```' >> coverage_report.md
+          else
+            echo "No coverage summary generated." >> coverage_report.md
+          fi
+          echo "" >> coverage_report.md
+          echo "### Test Results" >> coverage_report.md
+          if [ $TEST_EXIT -eq 0 ]; then
+            echo "✅ All tests passed!" >> coverage_report.md
+          else
+            echo "❌ Some tests failed." >> coverage_report.md
+            echo '```' >> coverage_report.md
+            tail -50 test-output.txt >> coverage_report.md
+            echo '```' >> coverage_report.md
+          fi
+      
+      - name: Post Test Coverage Report as PR Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('coverage_report.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run npm audit for vulnerabilities
+        id: audit
+        run: |
+          npm audit --json > audit.json 2>&1 || true
+          echo "audit_exit_code=$?" >> $GITHUB_OUTPUT
+      
+      - name: Scan for secrets (basic grep)
+        id: secrets
+        run: |
+          echo "Scanning for potential secrets..." > secrets.txt
+          grep -r "password\|secret\|token\|key\|api_key\|access_token" src/ --include="*.js" 2>/dev/null | head -20 >> secrets.txt || echo "No matches found" >> secrets.txt
+          echo "secrets_found=$?" >> $GITHUB_OUTPUT
+      
+      - name: Compile Security Scan Report
+        id: security_report
+        run: |
+          echo "## Security Scan Report" > security_report.md
+          echo "" >> security_report.md
+          echo "### Dependency Vulnerabilities" >> security_report.md
+          if [ -f audit.json ]; then
+            echo "Vulnerabilities scanned via npm audit." >> security_report.md
+            echo '```json' >> security_report.md
+            cat audit.json | head -100 >> security_report.md
+            echo '```' >> security_report.md
+          else
+            echo "No audit data." >> security_report.md
+          fi
+          echo "" >> security_report.md
+          echo "### Potential Secrets in Code Changes" >> security_report.md
+          cat secrets.txt >> security_report.md
+      
+      - name: Post Security Scan Report as PR Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('security_report.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+
+  build-validation:
+    name: Build Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build application
+        id: build
+        run: |
+          npm run build 2>&1 | tee build-output.txt
+          echo "build_exit_code=$?" >> $GITHUB_OUTPUT
+      
+      - name: Start server in background
+        id: server
+        run: |
+          npm start &
+          sleep 5
+          SERVER_PID=$!
+          echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
+      
+      - name: Validate endpoints
+        id: validate
+        run: |
+          curl -f http://localhost:3000/health 2>&1 | tee health-check.txt
+          echo "health_exit_code=$?" >> $GITHUB_OUTPUT
+          curl -f http://localhost:3000/ 2>&1 | tee root-check.txt
+          echo "root_exit_code=$?" >> $GITHUB_OUTPUT
+      
+      - name: Stop server
+        if: always()
+        run: |
+          if [ ! -z "${{ steps.server.outputs.server_pid }}" ]; then
+            kill ${{ steps.server.outputs.server_pid }} 2>/dev/null || true
+          fi
+      
+      - name: Compile Build Validation Report
+        id: build_report
+        run: |
+          BUILD_EXIT=${{ steps.build.outputs.build_exit_code }}
+          HEALTH_EXIT=${{ steps.validate.outputs.health_exit_code }}
+          ROOT_EXIT=${{ steps.validate.outputs.root_exit_code }}
+          echo "## Build Validation" > build_report.md
+          echo "" >> build_report.md
+          echo "### Build Status" >> build_report.md
+          if [ $BUILD_EXIT -eq 0 ]; then
+            echo "✅ Build succeeded." >> build_report.md
+          else
+            echo "❌ Build failed." >> build_report.md
+            cat build-output.txt >> build_report.md
+          fi
+          echo "" >> build_report.md
+          echo "### Endpoint Validation" >> build_report.md
+          if [ $HEALTH_EXIT -eq 0 ]; then
+            echo "✅ Health endpoint accessible." >> build_report.md
+          else
+            echo "❌ Health endpoint unreachable." >> build_report.md
+          fi
+          if [ $ROOT_EXIT -eq 0 ]; then
+            echo "✅ Root endpoint accessible." >> build_report.md
+          else
+            echo "❌ Root endpoint unreachable." >> build_report.md
+          fi
+      
+      - name: Post Build Validation Report as PR Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('build_report.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
